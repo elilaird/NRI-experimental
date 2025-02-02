@@ -6,9 +6,14 @@ import argparse
 import pickle
 import os
 import datetime
+import math
 
+import torch
+import torch.nn as nn
 import torch.optim as optim
 from torch.optim import lr_scheduler
+import torch.nn.functional as F
+from torch.autograd import Variable
 
 from utils import *
 from modules import *
@@ -122,6 +127,8 @@ elif args.encoder == 'cnn':
     encoder = CNNEncoder(args.dims, args.encoder_hidden,
                          args.edge_types,
                          args.encoder_dropout, args.factor)
+elif args.encoder == 'attn':
+    encoder = AttentionEncoder(args.dims, args.encoder_hidden, args.edge_types, args.encoder_dropout)
 
 if args.decoder == 'mlp':
     decoder = MLPDecoder(n_in_node=args.dims,
@@ -402,3 +409,54 @@ test()
 if log is not None:
     print(save_folder)
     log.close()
+
+class AttentionEncoder(nn.Module):
+    """Encoder using multi-head attention to infer edge types."""
+    def __init__(self, dims, hidden_dim, edge_types, dropout=0.0, num_heads=4):
+        super(AttentionEncoder, self).__init__()
+        
+        self.edge_types = edge_types
+        self.num_heads = num_heads
+        head_dim = hidden_dim // num_heads
+        
+        # Linear projections for Q, K, V
+        self.q_proj = nn.Linear(dims, hidden_dim)
+        self.k_proj = nn.Linear(dims, hidden_dim)
+        self.v_proj = nn.Linear(dims, hidden_dim)
+        
+        # Output projection to edge types - outputs logits for each edge type
+        self.out_proj = nn.Linear(hidden_dim * 2, edge_types)  # *2 because we concatenate sender/receiver
+        
+        self.dropout = nn.Dropout(dropout)
+        
+    def forward(self, inputs, rel_rec, rel_send):
+        # inputs: [batch_size, num_atoms, timesteps, dims]
+        batch_size = inputs.size(0)
+        num_atoms = inputs.size(1)
+        
+        # Reshape and project inputs
+        x = inputs.reshape(batch_size, num_atoms, -1)
+        
+        # Multi-head attention
+        q = self.q_proj(x).view(batch_size, num_atoms, self.num_heads, -1)
+        k = self.k_proj(x).view(batch_size, num_atoms, self.num_heads, -1)
+        v = self.v_proj(x).view(batch_size, num_atoms, self.num_heads, -1)
+        
+        # Compute attention scores
+        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(k.size(-1))
+        attn = F.softmax(scores, dim=-1)
+        attn = self.dropout(attn)
+        
+        # Get attention output
+        out = torch.matmul(attn, v)
+        out = out.reshape(batch_size, num_atoms, -1)
+        
+        # Project to edge logits for each pair of nodes
+        receivers = torch.matmul(rel_rec, out)  # Shape: [batch_size, num_edges, hidden_dim]
+        senders = torch.matmul(rel_send, out)   # Shape: [batch_size, num_edges, hidden_dim]
+        edges = torch.cat([senders, receivers], dim=-1)
+        
+        # Output logits for each edge type
+        edge_logits = self.out_proj(edges)  # Shape: [batch_size, num_edges, edge_types]
+        
+        return edge_logits
